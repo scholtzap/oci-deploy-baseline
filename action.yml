@@ -1,0 +1,101 @@
+name: OCI rsync
+description: Rsync a local path to an OCI (or any SSH) host. Optional key passphrase via ssh-agent.
+author: scholtzap
+
+inputs:
+  host:
+    description: SSH host (IP or hostname)
+    required: true
+  ssh_key:
+    description: Private SSH key contents
+    required: true
+  ssh_passphrase:
+    description: Optional passphrase for the SSH key
+    required: false
+    default: ""
+  remote_path:
+    description: Absolute remote destination directory (trailing slash recommended)
+    required: true
+  local_path:
+    description: Local source path
+    required: false
+    default: "."
+  delete:
+    description: Pass rsync --delete (true/false). Prefer false when mirroring git-archive style deploys.
+    required: false
+    default: "false"
+  excludes:
+    description: Newline-separated rsync --exclude patterns
+    required: false
+    default: |
+      .git/
+      .github/
+      .env
+      .env.*
+      __pycache__/
+      .venv/
+      node_modules/
+  ssh_user:
+    description: SSH username
+    required: false
+    default: ubuntu
+  extra_rsync_args:
+    description: Extra rsync arguments (advanced)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Configure SSH agent
+      shell: bash
+      env:
+        OCI_SSH_KEY: ${{ inputs.ssh_key }}
+        OCI_SSH_PASSPHRASE: ${{ inputs.ssh_passphrase }}
+      run: |
+        set -euo pipefail
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        KEYFILE=$(mktemp)
+        printf '%s\n' "$OCI_SSH_KEY" > "$KEYFILE"
+        chmod 600 "$KEYFILE"
+        eval "$(ssh-agent -s)"
+        echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+        echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+        if [ -n "${OCI_SSH_PASSPHRASE:-}" ]; then
+          ASKPASS=$(mktemp)
+          printf '#!/bin/sh\necho "%s"\n' "$OCI_SSH_PASSPHRASE" > "$ASKPASS"
+          chmod 700 "$ASKPASS"
+          DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid -w ssh-add "$KEYFILE" </dev/null
+          rm -f "$ASKPASS"
+        else
+          ssh-add "$KEYFILE"
+        fi
+        rm -f "$KEYFILE"
+        ssh-keyscan -H "${{ inputs.host }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+    - name: Rsync to remote
+      shell: bash
+      env:
+        EXCLUDES: ${{ inputs.excludes }}
+      run: |
+        set -euo pipefail
+        DEST="${{ inputs.ssh_user }}@${{ inputs.host }}:${{ inputs.remote_path }}"
+        ARGS=(-az)
+        if [ "${{ inputs.delete }}" = "true" ]; then
+          ARGS+=(--delete)
+        fi
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="${line#"${line%%[![:space:]]*}"}"
+          line="${line%"${line##*[![:space:]]}"}"
+          [ -z "$line" ] && continue
+          ARGS+=(--exclude="$line")
+        done <<< "$EXCLUDES"
+        # shellcheck disable=SC2086
+        extra=( ${{ inputs.extra_rsync_args }} )
+        echo "📤 rsync ${ARGS[*]} ${extra[*]:-} → $DEST"
+        rsync "${ARGS[@]}" ${extra[@]+"${extra[@]}"} \
+          -e "ssh -o StrictHostKeyChecking=no" \
+          "${{ inputs.local_path }}" \
+          "$DEST"
+        echo "✅ rsync complete"
