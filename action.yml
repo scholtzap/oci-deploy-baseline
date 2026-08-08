@@ -65,10 +65,7 @@ runs:
         if [ -n "${OCI_SSH_PASSPHRASE:-}" ]; then
           export OCI_SSH_PASSPHRASE
           ASKPASS=$(mktemp)
-          cat > "$ASKPASS" <<'EOF'
-        #!/bin/sh
-        printf '%s\n' "$OCI_SSH_PASSPHRASE"
-        EOF
+          printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$OCI_SSH_PASSPHRASE"' > "$ASKPASS"
           chmod 700 "$ASKPASS"
           DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force \
             setsid -w ssh-add "$KEYFILE" </dev/null
