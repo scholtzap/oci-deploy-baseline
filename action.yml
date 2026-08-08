@@ -1,5 +1,5 @@
 name: OCI rsync
-description: Rsync a local path to an OCI (or any SSH) host. Optional key passphrase via ssh-agent.
+description: Rsync local path(s) to an OCI (or any SSH) host. Optional key passphrase via ssh-agent.
 author: scholtzap
 
 inputs:
@@ -14,12 +14,16 @@ inputs:
     required: false
     default: ""
   remote_path:
-    description: Absolute remote destination directory (trailing slash recommended)
+    description: Absolute remote destination directory (no trailing slash required)
     required: true
   local_path:
-    description: Local source path
+    description: Local source path when paths is empty
     required: false
     default: "."
+  paths:
+    description: Newline-separated relative dirs/files to rsync into remote_path/<name>. When set, local_path is ignored.
+    required: false
+    default: ""
   delete:
     description: Pass rsync --delete (true/false). Prefer false when mirroring git-archive style deploys.
     required: false
@@ -39,10 +43,6 @@ inputs:
     description: SSH username
     required: false
     default: ubuntu
-  extra_rsync_args:
-    description: Extra rsync arguments (advanced)
-    required: false
-    default: ""
 
 runs:
   using: composite
@@ -57,16 +57,21 @@ runs:
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
         KEYFILE=$(mktemp)
-        printf '%s\n' "$OCI_SSH_KEY" > "$KEYFILE"
+        printf '%s\n' "$OCI_SSH_KEY" | tr -d '\r' > "$KEYFILE"
         chmod 600 "$KEYFILE"
         eval "$(ssh-agent -s)"
         echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
         echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
         if [ -n "${OCI_SSH_PASSPHRASE:-}" ]; then
+          export OCI_SSH_PASSPHRASE
           ASKPASS=$(mktemp)
-          printf '#!/bin/sh\necho "%s"\n' "$OCI_SSH_PASSPHRASE" > "$ASKPASS"
+          cat > "$ASKPASS" <<'EOF'
+        #!/bin/sh
+        printf '%s\n' "$OCI_SSH_PASSPHRASE"
+        EOF
           chmod 700 "$ASKPASS"
-          DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid -w ssh-add "$KEYFILE" </dev/null
+          DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force \
+            setsid -w ssh-add "$KEYFILE" </dev/null
           rm -f "$ASKPASS"
         else
           ssh-add "$KEYFILE"
@@ -78,24 +83,57 @@ runs:
       shell: bash
       env:
         EXCLUDES: ${{ inputs.excludes }}
+        PATHS: ${{ inputs.paths }}
+        DELETE_FLAG: ${{ inputs.delete }}
+        REMOTE_ROOT: ${{ inputs.remote_path }}
+        SSH_USER: ${{ inputs.ssh_user }}
+        HOST: ${{ inputs.host }}
+        LOCAL_PATH: ${{ inputs.local_path }}
       run: |
         set -euo pipefail
-        DEST="${{ inputs.ssh_user }}@${{ inputs.host }}:${{ inputs.remote_path }}"
-        ARGS=(-az)
-        if [ "${{ inputs.delete }}" = "true" ]; then
-          ARGS+=(--delete)
+        USER_HOST="${SSH_USER}@${HOST}"
+        REMOTE_ROOT="${REMOTE_ROOT%/}"
+
+        RSYNC_ARGS=(-az)
+        if [ "$DELETE_FLAG" = "true" ]; then
+          RSYNC_ARGS+=(--delete)
         fi
         while IFS= read -r line || [ -n "$line" ]; do
           line="${line#"${line%%[![:space:]]*}"}"
           line="${line%"${line##*[![:space:]]}"}"
           [ -z "$line" ] && continue
-          ARGS+=(--exclude="$line")
+          RSYNC_ARGS+=(--exclude="$line")
         done <<< "$EXCLUDES"
-        # shellcheck disable=SC2086
-        extra=( ${{ inputs.extra_rsync_args }} )
-        echo "📤 rsync ${ARGS[*]} ${extra[*]:-} → $DEST"
-        rsync "${ARGS[@]}" ${extra[@]+"${extra[@]}"} \
-          -e "ssh -o StrictHostKeyChecking=no" \
-          "${{ inputs.local_path }}" \
-          "$DEST"
+
+        do_rsync() {
+          local src="$1"
+          local dest="$2"
+          echo "📤 rsync → ${dest}"
+          rsync "${RSYNC_ARGS[@]}" -e "ssh -o StrictHostKeyChecking=no" "$src" "$dest"
+        }
+
+        if [ -n "${PATHS//[[:space:]]/}" ]; then
+          while IFS= read -r p || [ -n "$p" ]; do
+            p="${p#"${p%%[![:space:]]*}"}"
+            p="${p%"${p##*[![:space:]]}"}"
+            [ -z "$p" ] && continue
+            if [ ! -e "$p" ]; then
+              echo "⚠️  skip missing path: $p"
+              continue
+            fi
+            if [ -d "$p" ]; then
+              do_rsync "${p}/" "${USER_HOST}:${REMOTE_ROOT}/${p}/"
+            else
+              ssh -o StrictHostKeyChecking=no "$USER_HOST" "mkdir -p \"$(dirname "${REMOTE_ROOT}/${p}")\""
+              do_rsync "$p" "${USER_HOST}:${REMOTE_ROOT}/${p}"
+            fi
+          done <<< "$PATHS"
+        else
+          src="$LOCAL_PATH"
+          if [ -d "$src" ]; then
+            do_rsync "${src%/}/" "${USER_HOST}:${REMOTE_ROOT}/"
+          else
+            do_rsync "$src" "${USER_HOST}:${REMOTE_ROOT}/"
+          fi
+        fi
         echo "✅ rsync complete"
