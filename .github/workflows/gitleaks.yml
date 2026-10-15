@@ -1,0 +1,57 @@
+name: gitleaks
+
+# Server-side backstop for the local global pre-commit scan: catches pushes from other machines,
+# the web editor and --no-verify. PRs and pushes scan only their new commits (deterministic; no
+# baseline needed). Run manually for a full-history audit (uses .gitleaksignore). Findings redacted.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          f="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$f"
+          echo "${GITLEAKS_SHA256}  $f" | sha256sum -c -
+          tar -xzf "$f" gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+      - name: Scan (redacted)
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          case "$EVENT" in
+            pull_request) range="$PR_BASE..$PR_HEAD" ;;
+            push)
+              if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                range="origin/$DEFAULT_BRANCH..$SHA"
+              else
+                range="$BEFORE..$SHA"
+              fi ;;
+            *) range="" ;;
+          esac
+          if [ -n "$range" ]; then
+            echo "Scanning new commits: $range"
+            gitleaks git --redact --no-banner --verbose --log-opts="$range" .
+          else
+            echo "Full-history audit"
+            gitleaks git --redact --no-banner --verbose .
+          fi
